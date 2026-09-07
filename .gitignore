@@ -14,6 +14,7 @@
 # Binaries
 cmd/gophermart/main
 cmd/gophermart/gophermart
+/gophermart
 
 # Dependency directories (remove the comment below to include it)
 vendor/
@@ -21,3 +22,8 @@ vendor/
 # IDEs directories
 .idea
 .vscode
+
+# Local env and coverage
+.env
+coverage.out
+coverage.html
