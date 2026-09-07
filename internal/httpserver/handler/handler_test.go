@@ -3,18 +3,18 @@ package handler_test
 import (
 	"context"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"log/slog"
+
 	"github.com/stepantishhen/gofermart/internal/domain"
 	"github.com/stepantishhen/gofermart/internal/httpserver"
 	"github.com/stepantishhen/gofermart/internal/httpserver/handler"
 	"github.com/stepantishhen/gofermart/internal/service"
-	"log/slog"
 )
 
 type stubAuth struct {
@@ -66,7 +66,10 @@ func newServer(a handler.AuthService, o handler.OrderService, b handler.BalanceS
 	return httpserver.NewRouter(h, stubParser{}, slog.New(slog.DiscardHandler))
 }
 
-func do(t *testing.T, srv http.Handler, method, path, body string, authed bool) *http.Response {
+// do drives one request through srv and returns the recorder. Using the
+// recorder directly (not rec.Result()) keeps the test free of an unclosed
+// *http.Response body.
+func do(t *testing.T, srv http.Handler, method, path, body string, authed bool) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	if authed {
@@ -74,39 +77,39 @@ func do(t *testing.T, srv http.Handler, method, path, body string, authed bool) 
 	}
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
-	return rec.Result()
+	return rec
 }
 
 func TestRegister(t *testing.T) {
 	srv := newServer(stubAuth{token: "tok"}, stubOrders{}, stubBalance{})
 
 	resp := do(t, srv, http.MethodPost, "/api/user/register", `{"login":"a","password":"b"}`, false)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", resp.StatusCode)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d", resp.Code)
 	}
-	if resp.Header.Get("Authorization") == "" {
+	if resp.Header().Get("Authorization") == "" {
 		t.Fatal("missing Authorization header")
 	}
 
 	resp = do(t, srv, http.MethodPost, "/api/user/register", `not json`, false)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("bad json status = %d", resp.StatusCode)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("bad json status = %d", resp.Code)
 	}
 }
 
 func TestRegisterConflict(t *testing.T) {
 	srv := newServer(stubAuth{err: domain.ErrLoginTaken}, stubOrders{}, stubBalance{})
 	resp := do(t, srv, http.MethodPost, "/api/user/register", `{"login":"a","password":"b"}`, false)
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d", resp.StatusCode)
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("status = %d", resp.Code)
 	}
 }
 
 func TestLoginUnauthorized(t *testing.T) {
 	srv := newServer(stubAuth{err: domain.ErrInvalidCredentials}, stubOrders{}, stubBalance{})
 	resp := do(t, srv, http.MethodPost, "/api/user/login", `{"login":"a","password":"b"}`, false)
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d", resp.StatusCode)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d", resp.Code)
 	}
 }
 
@@ -126,8 +129,8 @@ func TestUploadOrder(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			srv := newServer(stubAuth{}, stubOrders{uploadErr: c.err}, stubBalance{})
 			resp := do(t, srv, http.MethodPost, "/api/user/orders", "12345678903", true)
-			if resp.StatusCode != c.want {
-				t.Fatalf("status = %d, want %d", resp.StatusCode, c.want)
+			if resp.Code != c.want {
+				t.Fatalf("status = %d, want %d", resp.Code, c.want)
 			}
 		})
 	}
@@ -136,16 +139,16 @@ func TestUploadOrder(t *testing.T) {
 func TestUploadOrderUnauthorized(t *testing.T) {
 	srv := newServer(stubAuth{}, stubOrders{}, stubBalance{})
 	resp := do(t, srv, http.MethodPost, "/api/user/orders", "12345678903", false)
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d", resp.StatusCode)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d", resp.Code)
 	}
 }
 
 func TestListOrders(t *testing.T) {
 	srv := newServer(stubAuth{}, stubOrders{}, stubBalance{})
 	resp := do(t, srv, http.MethodGet, "/api/user/orders", "", true)
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("empty list status = %d", resp.StatusCode)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("empty list status = %d", resp.Code)
 	}
 
 	acc := domain.NewMoneyFromFloat(500)
@@ -153,11 +156,11 @@ func TestListOrders(t *testing.T) {
 		{Number: "9278923470", Status: domain.OrderStatusProcessed, Accrual: acc, HasAccrual: true, UploadedAt: time.Now()},
 	}}, stubBalance{})
 	resp = do(t, srv, http.MethodGet, "/api/user/orders", "", true)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", resp.StatusCode)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d", resp.Code)
 	}
-	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), `"accrual":500`) || !strings.Contains(string(body), `"number":"9278923470"`) {
+	body := resp.Body.String()
+	if !strings.Contains(body, `"accrual":500`) || !strings.Contains(body, `"number":"9278923470"`) {
 		t.Fatalf("unexpected body: %s", body)
 	}
 }
@@ -168,9 +171,9 @@ func TestGetBalance(t *testing.T) {
 		Withdrawn: domain.NewMoneyFromFloat(42),
 	}})
 	resp := do(t, srv, http.MethodGet, "/api/user/balance", "", true)
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"current":500.5`) || !strings.Contains(string(body), `"withdrawn":42`) {
-		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	body := resp.Body.String()
+	if resp.Code != http.StatusOK || !strings.Contains(body, `"current":500.5`) || !strings.Contains(body, `"withdrawn":42`) {
+		t.Fatalf("status=%d body=%s", resp.Code, body)
 	}
 }
 
@@ -190,8 +193,8 @@ func TestWithdraw(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			srv := newServer(stubAuth{}, stubOrders{}, stubBalance{withdrawErr: c.err})
 			resp := do(t, srv, http.MethodPost, "/api/user/balance/withdraw", `{"order":"2377225624","sum":10}`, true)
-			if resp.StatusCode != c.want {
-				t.Fatalf("status = %d, want %d", resp.StatusCode, c.want)
+			if resp.Code != c.want {
+				t.Fatalf("status = %d, want %d", resp.Code, c.want)
 			}
 		})
 	}
@@ -200,91 +203,91 @@ func TestWithdraw(t *testing.T) {
 func TestListWithdrawals(t *testing.T) {
 	srv := newServer(stubAuth{}, stubOrders{}, stubBalance{})
 	resp := do(t, srv, http.MethodGet, "/api/user/withdrawals", "", true)
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("empty status = %d", resp.StatusCode)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("empty status = %d", resp.Code)
 	}
 
 	srv = newServer(stubAuth{}, stubOrders{}, stubBalance{withdrawals: []domain.Withdrawal{
 		{OrderNumber: "2377225624", Sum: domain.NewMoneyFromFloat(500), ProcessedAt: time.Now()},
 	}})
 	resp = do(t, srv, http.MethodGet, "/api/user/withdrawals", "", true)
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"order":"2377225624"`) {
-		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	body := resp.Body.String()
+	if resp.Code != http.StatusOK || !strings.Contains(body, `"order":"2377225624"`) {
+		t.Fatalf("status=%d body=%s", resp.Code, body)
 	}
 }
 
 func TestRegisterInvalidInputAndInternal(t *testing.T) {
 	srv := newServer(stubAuth{err: service.ErrInvalidInput}, stubOrders{}, stubBalance{})
-	if resp := do(t, srv, http.MethodPost, "/api/user/register", `{"login":"a","password":""}`, false); resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("invalid input status = %d", resp.StatusCode)
+	if resp := do(t, srv, http.MethodPost, "/api/user/register", `{"login":"a","password":""}`, false); resp.Code != http.StatusBadRequest {
+		t.Fatalf("invalid input status = %d", resp.Code)
 	}
 
 	srv = newServer(stubAuth{err: errors.New("boom")}, stubOrders{}, stubBalance{})
-	if resp := do(t, srv, http.MethodPost, "/api/user/register", `{"login":"a","password":"b"}`, false); resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("internal status = %d", resp.StatusCode)
+	if resp := do(t, srv, http.MethodPost, "/api/user/register", `{"login":"a","password":"b"}`, false); resp.Code != http.StatusInternalServerError {
+		t.Fatalf("internal status = %d", resp.Code)
 	}
 }
 
 func TestLogin(t *testing.T) {
 	srv := newServer(stubAuth{token: "tok"}, stubOrders{}, stubBalance{})
 	resp := do(t, srv, http.MethodPost, "/api/user/login", `{"login":"a","password":"b"}`, false)
-	if resp.StatusCode != http.StatusOK || resp.Header.Get("Authorization") == "" {
-		t.Fatalf("status=%d auth=%q", resp.StatusCode, resp.Header.Get("Authorization"))
+	if resp.Code != http.StatusOK || resp.Header().Get("Authorization") == "" {
+		t.Fatalf("status=%d auth=%q", resp.Code, resp.Header().Get("Authorization"))
 	}
 
-	if resp := do(t, srv, http.MethodPost, "/api/user/login", `not json`, false); resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("bad json status = %d", resp.StatusCode)
+	if resp := do(t, srv, http.MethodPost, "/api/user/login", `not json`, false); resp.Code != http.StatusBadRequest {
+		t.Fatalf("bad json status = %d", resp.Code)
 	}
 
 	srv = newServer(stubAuth{err: service.ErrInvalidInput}, stubOrders{}, stubBalance{})
-	if resp := do(t, srv, http.MethodPost, "/api/user/login", `{"login":"","password":""}`, false); resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("invalid input status = %d", resp.StatusCode)
+	if resp := do(t, srv, http.MethodPost, "/api/user/login", `{"login":"","password":""}`, false); resp.Code != http.StatusBadRequest {
+		t.Fatalf("invalid input status = %d", resp.Code)
 	}
 
 	srv = newServer(stubAuth{err: errors.New("boom")}, stubOrders{}, stubBalance{})
-	if resp := do(t, srv, http.MethodPost, "/api/user/login", `{"login":"a","password":"b"}`, false); resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("internal status = %d", resp.StatusCode)
+	if resp := do(t, srv, http.MethodPost, "/api/user/login", `{"login":"a","password":"b"}`, false); resp.Code != http.StatusInternalServerError {
+		t.Fatalf("internal status = %d", resp.Code)
 	}
 }
 
 func TestUploadOrderEmptyBody(t *testing.T) {
 	srv := newServer(stubAuth{}, stubOrders{}, stubBalance{})
 	resp := do(t, srv, http.MethodPost, "/api/user/orders", "", true)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("empty body status = %d", resp.StatusCode)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("empty body status = %d", resp.Code)
 	}
 }
 
 func TestListOrdersServiceError(t *testing.T) {
 	srv := newServer(stubAuth{}, stubOrders{listErr: errors.New("boom")}, stubBalance{})
 	resp := do(t, srv, http.MethodGet, "/api/user/orders", "", true)
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("status = %d", resp.StatusCode)
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d", resp.Code)
 	}
 }
 
 func TestGetBalanceServiceError(t *testing.T) {
 	srv := newServer(stubAuth{}, stubOrders{}, stubBalance{getErr: errors.New("boom")})
 	resp := do(t, srv, http.MethodGet, "/api/user/balance", "", true)
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("status = %d", resp.StatusCode)
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d", resp.Code)
 	}
 }
 
 func TestWithdrawBadJSON(t *testing.T) {
 	srv := newServer(stubAuth{}, stubOrders{}, stubBalance{})
 	resp := do(t, srv, http.MethodPost, "/api/user/balance/withdraw", `not json`, true)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d", resp.StatusCode)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", resp.Code)
 	}
 }
 
 func TestListWithdrawalsServiceError(t *testing.T) {
 	srv := newServer(stubAuth{}, stubOrders{}, stubBalance{withdrawalsErr: errors.New("boom")})
 	resp := do(t, srv, http.MethodGet, "/api/user/withdrawals", "", true)
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("status = %d", resp.StatusCode)
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d", resp.Code)
 	}
 }
 
