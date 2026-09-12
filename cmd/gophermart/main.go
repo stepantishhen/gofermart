@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -19,6 +20,7 @@ import (
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "config error:", err)
 		os.Exit(2)
 	}
 

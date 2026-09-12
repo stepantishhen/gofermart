@@ -64,9 +64,8 @@ func (w *Worker) pollOnce(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := w.process(ctx, o.Number); err != nil {
-			var tmr *TooManyRequestsError
-			if errors.As(err, &tmr) {
+		if err := w.process(ctx, o); err != nil {
+			if tmr, ok := errors.AsType[*TooManyRequestsError](err); ok {
 				w.log.Warn("accrual rate limited", "sleep", tmr.RetryAfter)
 				select {
 				case <-ctx.Done():
@@ -79,8 +78,11 @@ func (w *Worker) pollOnce(ctx context.Context) {
 	}
 }
 
-func (w *Worker) process(ctx context.Context, number string) error {
-	res, err := w.fetcher.Get(ctx, number)
+// process fetches the current accrual result for o and writes it back only if
+// something actually changed since the last poll, so an order stuck in
+// PROCESSING doesn't open a write transaction on every tick.
+func (w *Worker) process(ctx context.Context, o domain.Order) error {
+	res, err := w.fetcher.Get(ctx, o.Number)
 	if err != nil {
 		if errors.Is(err, ErrOrderNotRegistered) {
 			return nil
@@ -89,10 +91,11 @@ func (w *Worker) process(ctx context.Context, number string) error {
 	}
 
 	status, final := mapStatus(res.Status)
-	if !final && !res.HasAccrual {
-		return w.store.ApplyAccrual(ctx, number, status, 0, false)
+	credit := final && status == domain.OrderStatusProcessed && res.HasAccrual
+	if status == o.Status && !credit {
+		return nil
 	}
-	return w.store.ApplyAccrual(ctx, number, status, res.Accrual, res.HasAccrual)
+	return w.store.ApplyAccrual(ctx, o.Number, status, res.Accrual, credit)
 }
 
 func mapStatus(s Status) (status domain.OrderStatus, final bool) {

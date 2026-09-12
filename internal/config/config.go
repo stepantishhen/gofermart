@@ -5,6 +5,7 @@ package config
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"time"
 )
@@ -49,17 +50,24 @@ func parse(args []string, lookupEnv func(string) (string, bool)) (*Config, error
 		return nil, err
 	}
 
-	if v, ok := lookupEnv("RUN_ADDRESS"); ok {
+	if v, ok := lookupEnv("RUN_ADDRESS"); ok && v != "" {
 		cfg.RunAddress = v
 	}
-	if v, ok := lookupEnv("DATABASE_URI"); ok {
+	if v, ok := lookupEnv("DATABASE_URI"); ok && v != "" {
 		cfg.DatabaseURI = v
 	}
-	if v, ok := lookupEnv("ACCRUAL_SYSTEM_ADDRESS"); ok {
+	if v, ok := lookupEnv("ACCRUAL_SYSTEM_ADDRESS"); ok && v != "" {
 		cfg.AccrualSystemAddress = v
 	}
-	if v, ok := lookupEnv("JWT_SECRET"); ok {
+	if v, ok := lookupEnv("JWT_SECRET"); ok && v != "" {
 		cfg.JWTSecret = v
+	}
+
+	if cfg.DatabaseURI == "" {
+		return nil, fmt.Errorf("database connection string is required: set -d or DATABASE_URI")
+	}
+	if cfg.AccrualSystemAddress == "" {
+		return nil, fmt.Errorf("accrual system address is required: set -r or ACCRUAL_SYSTEM_ADDRESS")
 	}
 
 	return cfg, nil

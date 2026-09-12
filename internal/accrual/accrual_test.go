@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stepantishhen/gofermart/internal/domain"
@@ -103,13 +104,21 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
+// appliedRecord is what fakeStore.ApplyAccrual received for one order, so
+// tests can assert not just the resulting status but whether a credit
+// actually happened.
+type appliedRecord struct {
+	status     domain.OrderStatus
+	accrual    domain.Money
+	hasAccrual bool
+}
+
 type fakeStore struct {
-	mu        sync.Mutex
-	pending   []domain.Order
-	applied   map[string]domain.OrderStatus
-	lastLimit int
-	listErr   error
-	applyErr  error
+	mu       sync.Mutex
+	pending  []domain.Order
+	applied  map[string]appliedRecord
+	listErr  error
+	applyErr error
 }
 
 func (f *fakeStore) ListPending(context.Context, int) ([]domain.Order, error) {
@@ -121,23 +130,30 @@ func (f *fakeStore) ListPending(context.Context, int) ([]domain.Order, error) {
 	return f.pending, nil
 }
 
-func (f *fakeStore) ApplyAccrual(_ context.Context, number string, status domain.OrderStatus, _ domain.Money, _ bool) error {
+func (f *fakeStore) ApplyAccrual(_ context.Context, number string, status domain.OrderStatus, accrual domain.Money, hasAccrual bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.applyErr != nil {
 		return f.applyErr
 	}
 	if f.applied == nil {
-		f.applied = map[string]domain.OrderStatus{}
+		f.applied = map[string]appliedRecord{}
 	}
-	f.applied[number] = status
+	f.applied[number] = appliedRecord{status: status, accrual: accrual, hasAccrual: hasAccrual}
 	return nil
 }
 
 func (f *fakeStore) appliedStatus(number string) domain.OrderStatus {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.applied[number]
+	return f.applied[number].status
+}
+
+func (f *fakeStore) wasApplied(number string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.applied[number]
+	return ok
 }
 
 type limitCapturingStore struct {
@@ -215,7 +231,7 @@ func TestWorkerPollOnceRateLimitedStopsBatch(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("pollOnce did not return after rate limit")
 	}
-	if _, seen := store.applied["b"]; seen {
+	if store.wasApplied("b") {
 		t.Fatal("batch should stop at the rate-limited order")
 	}
 }
@@ -233,7 +249,7 @@ func TestWorkerProcessFetchError(t *testing.T) {
 func TestWorkerProcessNotRegistered(t *testing.T) {
 	store := &fakeStore{}
 	w := NewWorker(store, fakeFetcher{}, discardLogger(), time.Hour, 10)
-	if err := w.process(context.Background(), "unknown"); err != nil {
+	if err := w.process(context.Background(), domain.Order{Number: "unknown"}); err != nil {
 		t.Fatalf("process = %v, want nil for unregistered order", err)
 	}
 	if len(store.applied) != 0 {
@@ -245,37 +261,82 @@ func TestWorkerProcessApplyError(t *testing.T) {
 	store := &fakeStore{applyErr: errors.New("write failed")}
 	fetcher := fakeFetcher{results: map[string]Result{"x": {Status: StatusProcessing}}}
 	w := NewWorker(store, fetcher, discardLogger(), time.Hour, 10)
-	if err := w.process(context.Background(), "x"); err == nil {
+	o := domain.Order{Number: "x", Status: domain.OrderStatusNew}
+	if err := w.process(context.Background(), o); err == nil {
 		t.Fatal("want the store error to propagate")
 	}
 }
 
-func TestWorkerRunStopsOnContextCancel(t *testing.T) {
-	store := &fakeStore{pending: []domain.Order{{Number: "a"}}}
+func TestWorkerProcessSkipsWriteWhenStatusUnchanged(t *testing.T) {
+	store := &fakeStore{}
+	fetcher := fakeFetcher{results: map[string]Result{"x": {Status: StatusProcessing}}}
+	w := NewWorker(store, fetcher, discardLogger(), time.Hour, 10)
+
+	o := domain.Order{Number: "x", Status: domain.OrderStatusProcessing}
+	if err := w.process(context.Background(), o); err != nil {
+		t.Fatalf("process = %v", err)
+	}
+	if store.wasApplied("x") {
+		t.Fatal("no write should happen when the accrual status has not changed")
+	}
+}
+
+func TestWorkerProcessOnlyCreditsOnFinalProcessed(t *testing.T) {
+	store := &fakeStore{}
 	fetcher := fakeFetcher{results: map[string]Result{
-		"a": {Status: StatusProcessed, Accrual: domain.NewMoneyFromFloat(5), HasAccrual: true},
+		// A non-final status carrying an accrual should be written (status
+		// changed) but never credited.
+		"x": {Status: StatusProcessing, Accrual: domain.NewMoneyFromFloat(50), HasAccrual: true},
 	}}
-	w := NewWorker(store, fetcher, discardLogger(), time.Millisecond, 10)
+	w := NewWorker(store, fetcher, discardLogger(), time.Hour, 10)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { w.Run(ctx); close(done) }()
+	o := domain.Order{Number: "x", Status: domain.OrderStatusNew}
+	if err := w.process(context.Background(), o); err != nil {
+		t.Fatalf("process = %v", err)
+	}
+	rec, ok := store.applied["x"]
+	if !ok {
+		t.Fatal("the NEW -> PROCESSING transition must still be written")
+	}
+	if rec.hasAccrual {
+		t.Fatal("accrual must not be credited before the order is PROCESSED")
+	}
+}
 
-	deadline := time.After(time.Second)
-	for store.appliedStatus("a") != domain.OrderStatusProcessed {
-		select {
-		case <-deadline:
+func TestWorkerRunStopsOnContextCancel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &fakeStore{pending: []domain.Order{{Number: "a"}}}
+		fetcher := fakeFetcher{results: map[string]Result{
+			"a": {Status: StatusProcessed, Accrual: domain.NewMoneyFromFloat(5), HasAccrual: true},
+		}}
+		w := NewWorker(store, fetcher, discardLogger(), time.Second, 10)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			w.Run(ctx)
+			close(done)
+		}()
+
+		// The fake clock only advances once every goroutine is durably
+		// blocked, so this fires the worker's first tick deterministically
+		// instead of racing a real timer.
+		time.Sleep(time.Second)
+		synctest.Wait()
+
+		if store.appliedStatus("a") != domain.OrderStatusProcessed {
 			t.Fatal("worker never processed the order")
-		case <-time.After(time.Millisecond):
 		}
-	}
-	cancel()
 
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("Run did not stop after context cancel")
-	}
+		cancel()
+		synctest.Wait()
+
+		select {
+		case <-done:
+		default:
+			t.Fatal("Run did not stop after context cancel")
+		}
+	})
 }
 
 func TestNewWorkerDefaultsBatchSize(t *testing.T) {
